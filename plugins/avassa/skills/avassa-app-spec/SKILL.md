@@ -11,42 +11,77 @@ Produce correct, deployable Avassa YAML: an **application**, its **application-d
    - Secrets: which values, consumed as env var or file, per-site or global, TLS certs needed?
    - Target sites (labels) and rollout style (all at once, rolling, canary).
 2. **Verify the schema if possible.** If the `supd` MCP tools are available (`get_model`, `search_model`, `get_docs`, `read_doc`), use `get_model ["config","applications",...]` / `["config","strongbox","vaults",...]` to confirm field names before writing anything unusual. Otherwise rely on the reference below and the redoc API docs.
-3. **Write files** using this layout (one resource per file, names as in Avassa's public examples):
+3. **Write files** in `supctl patch` format (see below), one resource per file, numbered in apply order as in Avassa's public examples (https://gitlab.com/avassa-public/application-examples, e.g. `mosquitto/`):
    ```
    <app>/
-     <app>.ca.yaml               # optional TLS CA (strongbox tls ca)
-     <app>.vault.yaml            # vault
-     credentials.<app>.secret.yaml   # secret(s) in that vault
-     <app>.app.yaml              # application
-     <app>.dep.yaml              # application-deployment
-     apply.sh                    # supctl commands in dependency order
+     01-tls-ca.yaml              # optional TLS CA (only if auto-cert is used)
+     02-vault.yaml               # vault
+     03-cert-secret.yaml         # optional auto-cert secret
+     04-credentials-secret.yaml  # secret(s) in that vault
+     05-app.yaml                 # application
+     06-deployment.yaml          # application-deployment
+     README.md                   # how to apply (supctl patch commands) and test
    ```
+   Drop the files that aren't needed and renumber so the numbers stay contiguous.
 4. **Run the checklist** at the end before handing over.
 
-Never put real secret values into files that may be committed. Use obvious placeholders (`CHANGE_ME`) or show the secret being created from env vars in `apply.sh`, and say so.
+Never put real secret values into files that may be committed. Use obvious placeholders (`CHANGE_ME`) and say so.
+
+## supctl patch format
+
+Every file is a single YAML document that starts with `---` and two header keys telling `supctl patch` where and how to write it, followed by the resource body exactly as the REST API expects it:
+
+```yaml
+---
+x-path: /v1/config/applications/myapp     # REST path of the resource itself (ends in its name)
+x-operation: replace                      # replace (PUT: create or overwrite) | create (POST: fails if it exists)
+name: myapp
+...
+```
+
+- Use `x-operation: replace` by default: it is idempotent, so the same files work for the first deploy and for updates.
+- `x-path` always ends with the resource's own name, which must equal the body's `name`.
+- Paths (note hyphens, not underscores):
+
+  | Resource               | `x-path`                                                   |
+  |------------------------|------------------------------------------------------------|
+  | TLS CA                 | `/v1/config/strongbox/tls/ca/<ca>`                         |
+  | Vault                  | `/v1/config/strongbox/vaults/<vault>`                      |
+  | Vault secret           | `/v1/config/strongbox/vaults/<vault>/secrets/<secret>`     |
+  | Application            | `/v1/config/applications/<app>`                            |
+  | Application deployment | `/v1/config/application-deployments/<deployment>`          |
+  | Resource profile       | `/v1/config/system/resource-profiles/<profile>`            |
+  | Policy                 | `/v1/config/policy/policies/<policy>`                      |
+
+All examples below show the full file including the header.
 
 ## Apply order (dependencies)
 
-CA → vault → secrets → application → application-deployment.
+CA → vault → secrets → application → application-deployment. The numbered file names encode this order.
 
 ```sh
-supctl create strongbox tls ca < myapp.ca.yaml          # only if auto-cert is used
-supctl create strongbox vaults < myapp.vault.yaml
-supctl create strongbox vaults myapp secrets < credentials.myapp.secret.yaml
-supctl create applications < myapp.app.yaml
-supctl create application-deployments < myapp.dep.yaml
+supctl patch < 01-tls-ca.yaml
+supctl patch < 02-vault.yaml
+supctl patch < 03-cert-secret.yaml
+supctl patch < 04-credentials-secret.yaml
+supctl patch < 05-app.yaml
+supctl patch < 06-deployment.yaml
+# or: for f in [0-9][0-9]-*.yaml; do supctl patch < "$f"; done
 ```
-Use `supctl replace ...` (PUT) or `supctl merge ...` (PATCH) for updates, e.g. `supctl replace applications myapp < myapp.app.yaml`. Check with `supctl show applications myapp` (look for `image-status: present`) and `supctl show application-deployments myapp-dep`.
+To update, edit the file and run `supctl patch < file` again. Check with `supctl show applications myapp` (look for `image-status: present`) and `supctl show application-deployments myapp`. Export an auto-generated CA cert with `supctl -j show strongbox tls ca myapp | jq -r '."ca-cert"' > ca-cert.pem`.
 
-REST equivalents: `POST /v1/config/strongbox/vaults`, `POST /v1/config/strongbox/vaults/{vault}/secrets`, `POST /v1/config/applications`, `POST /v1/config/application_deployments` (YAML or JSON body; `?dry-run=true` / `?validate=true` are useful).
+The same payloads can also be pasted into the Control Tower UI, or sent to the REST API at the `x-path` (PUT for `replace`, POST to the parent collection for `create`); drop the `x-*` keys when doing that.
 
 ## Strongbox vault
 
 ```yaml
+---
+x-path: /v1/config/strongbox/vaults/myapp
+x-operation: replace
 name: myapp                 # vault name
 distribute:                 # REQUIRED in practice: secrets go nowhere unless distributed
   deployments:              # same sites as these application-DEPLOYMENT names (not app names)
-    - myapp-dep
+    - myapp
   # alternatives (pick one):
   # to: all                 # all sites the tenant has
   # to: none                # Control Tower only (e.g. registry creds)
@@ -60,6 +95,9 @@ Prefer `distribute.deployments` so secrets only land where the app runs.
 ## Vault secret (key/value map)
 
 ```yaml
+---
+x-path: /v1/config/strongbox/vaults/myapp/secrets/credentials
+x-operation: replace
 name: credentials
 allow-application-access:          # "<application>.<service>.<container>"; avoid "*" in production
   - myapp.api.server
@@ -72,21 +110,29 @@ data:                              # plain-string values
 ```
 Other secret fields: `ttl`, `allow-config-access`, `allow-image-access` (legacy), `auto-cert`, `auto-acme-cert`, `auto-ssh-cert`.
 
-Creating with CAS: `supctl -q version=0 create strongbox vaults <vault> secrets < file`. Updating one key: `supctl merge strongbox vaults <vault> secrets credentials <<EOF\ndata:\n  password: new\nEOF`.
+`x-operation: replace` overwrites the whole secret, so the file must contain every key. To change a single key without touching the others, use plain supctl instead: `supctl merge strongbox vaults <vault> secrets credentials <<EOF\ndata:\n  password: new\nEOF`. CAS-protected vaults (`cas-required: true`) need `supctl -q version=<n> ...` and are not a good fit for patch files.
 
 ### Auto-generated TLS certificate
 
 ```yaml
-# myapp.ca.yaml
+# 01-tls-ca.yaml
+---
+x-path: /v1/config/strongbox/tls/ca/myapp-ca
+x-operation: replace
 name: myapp-ca
 ttl: 2y
+cert-key-type: rsa
 auto-renew:
   renew-threshold: 145d
   activate-threshold: 90d
 distribute:
-  deployments: [myapp-dep]
+  deployments: [myapp]
+```
+```yaml
+# 03-cert-secret.yaml
 ---
-# cert.myapp.secret.yaml
+x-path: /v1/config/strongbox/vaults/myapp/secrets/server-cert
+x-operation: replace
 name: server-cert
 allow-application-access: [myapp.api.server]
 auto-cert:
@@ -106,6 +152,9 @@ The secret exposes keys `cert.pem`, `cert.key`, `ca-cert.pem`. Mounted per servi
 Top level: `name`, `version`, `upgrade-from`, `services`, `network`, `labels`, `resources`, `icon`, `on-mutable-variable-change`.
 
 ```yaml
+---
+x-path: /v1/config/applications/myapp
+x-operation: replace
 name: myapp
 version: "1.0"                       # quoted string; if set, MUST change on every edit
 services:
@@ -219,7 +268,10 @@ One vault per site (`config-<site>`, each `distribute.sites: [<site>]`), referen
 ## Application deployment
 
 ```yaml
-name: myapp-dep
+---
+x-path: /v1/config/application-deployments/myapp
+x-operation: replace
+name: myapp                          # often the same as the application name
 application: myapp
 application-version: "1.0"           # or "*" = latest
 placement:
@@ -232,7 +284,7 @@ deploy-to-sites:                      # optional rollout control
   #   match-site-labels: city = stockholm
   # canary-healthy-time: 15m
 ```
-Operations: `supctl do application-deployments myapp-dep pause|resume|redeploy|canary-continue`. Run `redeploy` after new sites start matching the labels.
+Operations: `supctl do application-deployments myapp pause|resume|redeploy|canary-continue`. Run `redeploy` after new sites start matching the labels.
 
 ## Checklist before delivering
 
@@ -245,6 +297,7 @@ Operations: `supctl do application-deployments myapp-dep pause|resume|redeploy|c
 - [ ] `version` and `port-ranges` are quoted strings. Images have explicit tags.
 - [ ] Outbound access is granted if the app calls out. Ingress exists if it must be reached from the site LAN.
 - [ ] No real secret values in committed files.
-- [ ] `apply.sh` creates resources in dependency order.
+- [ ] Every file starts with `---`, `x-path` and `x-operation`. The last `x-path` segment equals `name`, and secret paths use the right vault.
+- [ ] Files are numbered in dependency order (CA → vault → secrets → app → deployment) and the README lists the `supctl patch < file` commands in that order.
 
-If the schema can't be confirmed (no supd tools, docs unreachable), say so and point to the matching redoc section so the user can validate with `supctl create ... ` against `?dry-run=true`.
+If the schema can't be confirmed (no supd tools, docs unreachable), say so and point to the matching redoc section (https://avassa-api.redoc.ly, tags `Applications`, `Application-Deployments`, `Vault`) so the user can check the fields.
