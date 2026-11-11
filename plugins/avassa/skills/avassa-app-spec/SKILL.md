@@ -55,7 +55,7 @@ name: myapp
 ...
 ```
 
-- Use `x-operation: replace` by default: it is idempotent, so the same files work for the first deploy and for updates.
+- Always use `x-operation: replace`: it is idempotent, so the same files work for the first deploy, for updates, and for re-applies (see Idempotency).
 - `x-path` always ends with the resource's own name, which must equal the body's `name`.
 - Paths (note hyphens, not underscores):
 
@@ -95,6 +95,20 @@ name: myapp
 ...
 ```
 
+## Idempotency (required)
+
+The configuration must be idempotent: applying the same file(s) with `supctl patch` any number of times must give the same result as applying them once, and a re-apply of unchanged content must change nothing (no new application version, no redeploy, no restarted services, no rotated secrets or certs). To guarantee that:
+
+- **Always `x-operation: replace`.** Never use `create`, which fails on the second run. Don't add `merge`-style partial payloads that depend on what is already there.
+- **Fully declarative payloads.** Each document states the complete desired resource. No shell substitution (`$(date)`, `$(openssl rand ...)`, `${RANDOM}`), timestamps, UUIDs, or other values that differ between runs. Values that must vary per site or host use Avassa variables (`${SYS_SITE}`, etc.), which the system expands, not the apply step.
+- **No generated secrets in the file.** If a secret value must be random, generate it once outside the file (or use `auto-cert` for certificates) and put the resulting value, or a `CHANGE_ME` placeholder, in the file. Never regenerate it on apply.
+- **No operational/read-only fields.** Don't copy output of `supctl show` into payloads: fields like `image-status`, generated `ca-cert`/`cert` data, status or timestamps are not config and make the payload differ from what is stored.
+- **Stable versions.** Don't bump `version` / `application-version` as part of applying; change them only when the content actually changes (and only once production versioning is in use, see Versioning).
+- **No imperative steps in the apply flow.** The README's apply instructions are just `supctl patch` commands. `supctl do ... redeploy`, `pause`, deletes, etc. are separate, explicit operations, never part of a re-runnable apply.
+- **Deterministic content.** Keep list order stable (volumes, mounts, env, ports) and avoid duplicates, so the stored config is byte-for-byte what the file says.
+
+When editing existing output, keep it idempotent: the edit should be the only difference a re-apply makes.
+
 ## Apply order (dependencies)
 
 CA → vault → secrets → application → application-deployment. In the single-file layout this is the order of the documents in the file. In the per-file layout, the numbered file names encode it.
@@ -114,7 +128,7 @@ supctl patch < 05-app.yaml
 supctl patch < 06-deployment.yaml
 # or: for f in [0-9][0-9]-*.yaml; do supctl patch < "$f"; done
 ```
-To update, edit the file and run `supctl patch < file` again. Re-applying the single file re-sends every payload; that is harmless with `replace`, but bump the application `version` only when the application itself changed. Check with `supctl show applications myapp` (look for `image-status: present`) and `supctl show application-deployments myapp`. Export an auto-generated CA cert with `supctl -j show strongbox tls ca myapp | jq -r '."ca-cert"' > ca-cert.pem`.
+To update, edit the file and run `supctl patch < file` again. Re-applying the single file re-sends every payload; that is harmless with `replace`. Once the app is versioned for production, bump `version` only when the application itself changed. Check with `supctl show applications myapp` (look for `image-status: present`) and `supctl show application-deployments myapp`. Export an auto-generated CA cert with `supctl -j show strongbox tls ca myapp | jq -r '."ca-cert"' > ca-cert.pem`.
 
 The same payloads can also be pasted into the Control Tower UI, or sent to the REST API at the `x-path` (PUT for `replace`, POST to the parent collection for `create`); drop the `x-*` keys when doing that.
 
@@ -202,7 +216,7 @@ Top level: `name`, `version`, `upgrade-from`, `services`, `network`, `labels`, `
 x-path: /v1/config/applications/myapp
 x-operation: replace
 name: myapp
-version: "1.0"                       # quoted string; if set, MUST change on every edit
+# version: "1.0"                     # omit until production (see Versioning); then quoted, and bumped on every edit
 services:
   - name: api
     mode: replicated
@@ -308,8 +322,15 @@ One vault per site (`config-<site>`, each `distribute.sites: [<site>]`), referen
 
 ### Versioning
 
-- No `version` + deployment `application-version: "*"` = every edit rolls out immediately (good for dev).
-- With `version`, every spec change needs a new version string. Add `upgrade-from` entries for controlled upgrades. The system keeps the last 3 versions.
+**Default (development): no `version`.** Leave `version` out of the application spec and use `application-version: "*"` in the deployment. Every edit then rolls out as soon as it is applied, with no version strings to keep bumping.
+
+**Production: add versions when the user says so.** When the user signals it's time for production (e.g. "ready for prod", "release this", "go live", "production deployment"):
+- Add a quoted `version` to the application. Use a version the user gives; otherwise `"1.0"` for a first release, or the next logical version if earlier ones exist. Say which version you picked.
+- Set the deployment's `application-version` to that exact version instead of `"*"`.
+- Suggest rollout control in the deployment (`deploy-to-sites`, optionally canary sites) if it isn't there yet.
+- From then on, every application change needs a new `version` and a matching `application-version` bump. Add `upgrade-from` entries for controlled upgrades. The system keeps the last 3 versions.
+
+Don't add `version` or pin `application-version` before that point, even when editing an existing spec, unless the user asks.
 
 ## Application deployment
 
@@ -319,7 +340,7 @@ x-path: /v1/config/application-deployments/myapp
 x-operation: replace
 name: myapp                          # often the same as the application name
 application: myapp
-application-version: "1.0"           # or "*" = latest
+application-version: "*"             # latest; pin to the app's version for production (see Versioning)
 placement:
   match-site-labels: >
     system/type = edge               # or system/name = <site>, or custom labels (case sensitive)
@@ -340,9 +361,11 @@ Operations: `supctl do application-deployments myapp pause|resume|redeploy|canar
 - [ ] Any `auto-cert.issuing-ca` CA exists and is distributed to the same sites.
 - [ ] Every `mounts[].volume-name` matches a service `volumes[].name`. `files[].name` matches a config-map item name or a secret key.
 - [ ] `config-map` uses `items:`. Vault volumes use `vault-secret:`.
-- [ ] `version` and `port-ranges` are quoted strings. Images have explicit tags.
+- [ ] Before production: no application `version`, and deployment `application-version: "*"`. For production: a quoted `version`, and `application-version` pinned to it.
+- [ ] `port-ranges` is a quoted string. Images have explicit tags.
 - [ ] Outbound access is granted if the app calls out. Ingress exists if it must be reached from the site LAN.
 - [ ] No real secret values in committed files.
+- [ ] Idempotent: all documents use `x-operation: replace`, contain no per-run values (dates, random values, shell substitution), no read-only fields, and re-applying unchanged files changes nothing (see Idempotency).
 - [ ] Every payload document starts with `---`, `x-path` and `x-operation`. The last `x-path` segment equals `name`, and secret paths use the right vault.
 - [ ] Payloads are in dependency order (CA → vault → secrets → app → deployment): document order in the single file, or file numbering in the per-file layout. The README shows the matching `supctl patch` command(s).
 - [ ] The layout is single-file unless the user asked for separate files (or the directory already uses them).
