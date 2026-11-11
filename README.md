@@ -8,6 +8,16 @@ Claude Code skills for generating Avassa payloads: application specs, applicatio
 |----------|-------------------|---------------------------------------------------------------------------------|
 | `avassa` | `avassa-app-spec` | Writes Avassa application specs, deployments and Strongbox vaults/secrets (YAML) |
 
+## Output
+
+The skill writes payloads in `supctl patch` format (each document carries `x-path` and `x-operation` headers). By default all payloads (TLS CA, vault, secrets, application, deployment) go in a single multi-document YAML file, applied with:
+
+```sh
+supctl patch < myapp.yaml
+```
+
+To get one numbered file per payload instead (as in the [Avassa application examples](https://gitlab.com/avassa-public/application-examples)), ask for it, e.g. "put each resource in a separate file". You can also ask Claude to split or merge existing output.
+
 ## Installation
 
 This repository is a Claude Code plugin marketplace (`avassa-skills`) containing the `avassa` plugin.

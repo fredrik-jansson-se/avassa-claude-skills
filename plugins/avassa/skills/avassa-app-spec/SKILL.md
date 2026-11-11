@@ -1,3 +1,8 @@
+---
+name: avassa-app-spec
+description: Write deployable Avassa YAML in supctl patch format (x-path/x-operation headers) - application specs, application deployments, Strongbox vaults and secrets, and TLS CAs with auto-generated certs. Use when the user asks to deploy, package or configure an app/container on Avassa, write an Avassa application spec or deployment, create Strongbox vaults/secrets, or produce supctl payloads.
+---
+
 # Avassa application specifications + Strongbox
 
 Produce correct, deployable Avassa YAML: an **application**, its **application-deployment**, and the **Strongbox vaults/secrets** (and optionally a TLS CA) it depends on. Sources: https://docs.avassa.io and https://avassa-api.redoc.ly (tags `Applications`, `Application-Deployments`, `Vault`).
@@ -11,7 +16,16 @@ Produce correct, deployable Avassa YAML: an **application**, its **application-d
    - Secrets: which values, consumed as env var or file, per-site or global, TLS certs needed?
    - Target sites (labels) and rollout style (all at once, rolling, canary).
 2. **Verify the schema if possible.** If the `supd` MCP tools are available (`get_model`, `search_model`, `get_docs`, `read_doc`), use `get_model ["config","applications",...]` / `["config","strongbox","vaults",...]` to confirm field names before writing anything unusual. Otherwise rely on the reference below and the redoc API docs.
-3. **Write files** in `supctl patch` format (see below), one resource per file, numbered in apply order as in Avassa's public examples (https://gitlab.com/avassa-public/application-examples, e.g. `mosquitto/`):
+3. **Write the payloads** in `supctl patch` format (see below), using one of two output layouts:
+
+   **Single file (default).** All payloads go in one multi-document YAML file, in dependency order, each document starting with `---`:
+   ```
+   <app>/
+     <app>.yaml     # CA, vault, secrets, application, deployment, in that order
+     README.md      # how to apply (supctl patch < <app>.yaml) and test
+   ```
+
+   **One file per payload.** Use this when the user asks for it (e.g. "separate files", "one file per resource", "like the avassa examples"), or when the target directory already uses that layout. Number the files in apply order as in Avassa's public examples (https://gitlab.com/avassa-public/application-examples, e.g. `mosquitto/`):
    ```
    <app>/
      01-tls-ca.yaml              # optional TLS CA (only if auto-cert is used)
@@ -23,13 +37,15 @@ Produce correct, deployable Avassa YAML: an **application**, its **application-d
      README.md                   # how to apply (supctl patch commands) and test
    ```
    Drop the files that aren't needed and renumber so the numbers stay contiguous.
+
+   The user can switch layouts at any time ("split it up", "merge into one file"). Convert the existing output rather than regenerating it, and keep the content identical. The payloads are the same in both layouts; only the file boundaries change.
 4. **Run the checklist** at the end before handing over.
 
 Never put real secret values into files that may be committed. Use obvious placeholders (`CHANGE_ME`) and say so.
 
 ## supctl patch format
 
-Every file is a single YAML document that starts with `---` and two header keys telling `supctl patch` where and how to write it, followed by the resource body exactly as the REST API expects it:
+Each payload is a YAML document that starts with `---` and two header keys telling `supctl patch` where and how to write it, followed by the resource body exactly as the REST API expects it. `supctl patch` accepts several such documents in one file and applies them in the order they appear:
 
 ```yaml
 ---
@@ -53,12 +69,42 @@ name: myapp
   | Resource profile       | `/v1/config/system/resource-profiles/<profile>`            |
   | Policy                 | `/v1/config/policy/policies/<policy>`                      |
 
-All examples below show the full file including the header.
+All examples below show each payload as a full document including the header. In the single-file layout, concatenate them in apply order:
+
+```yaml
+---
+x-path: /v1/config/strongbox/vaults/myapp
+x-operation: replace
+name: myapp
+distribute:
+  deployments: [myapp]
+---
+x-path: /v1/config/strongbox/vaults/myapp/secrets/credentials
+x-operation: replace
+name: credentials
+...
+---
+x-path: /v1/config/applications/myapp
+x-operation: replace
+name: myapp
+...
+---
+x-path: /v1/config/application-deployments/myapp
+x-operation: replace
+name: myapp
+...
+```
 
 ## Apply order (dependencies)
 
-CA → vault → secrets → application → application-deployment. The numbered file names encode this order.
+CA → vault → secrets → application → application-deployment. In the single-file layout this is the order of the documents in the file. In the per-file layout, the numbered file names encode it.
 
+Single file:
+```sh
+supctl patch < myapp.yaml
+```
+
+One file per payload:
 ```sh
 supctl patch < 01-tls-ca.yaml
 supctl patch < 02-vault.yaml
@@ -68,7 +114,7 @@ supctl patch < 05-app.yaml
 supctl patch < 06-deployment.yaml
 # or: for f in [0-9][0-9]-*.yaml; do supctl patch < "$f"; done
 ```
-To update, edit the file and run `supctl patch < file` again. Check with `supctl show applications myapp` (look for `image-status: present`) and `supctl show application-deployments myapp`. Export an auto-generated CA cert with `supctl -j show strongbox tls ca myapp | jq -r '."ca-cert"' > ca-cert.pem`.
+To update, edit the file and run `supctl patch < file` again. Re-applying the single file re-sends every payload; that is harmless with `replace`, but bump the application `version` only when the application itself changed. Check with `supctl show applications myapp` (look for `image-status: present`) and `supctl show application-deployments myapp`. Export an auto-generated CA cert with `supctl -j show strongbox tls ca myapp | jq -r '."ca-cert"' > ca-cert.pem`.
 
 The same payloads can also be pasted into the Control Tower UI, or sent to the REST API at the `x-path` (PUT for `replace`, POST to the parent collection for `create`); drop the `x-*` keys when doing that.
 
@@ -115,7 +161,7 @@ Other secret fields: `ttl`, `allow-config-access`, `allow-image-access` (legacy)
 ### Auto-generated TLS certificate
 
 ```yaml
-# 01-tls-ca.yaml
+# TLS CA (01-tls-ca.yaml in the per-file layout)
 ---
 x-path: /v1/config/strongbox/tls/ca/myapp-ca
 x-operation: replace
@@ -129,7 +175,7 @@ distribute:
   deployments: [myapp]
 ```
 ```yaml
-# 03-cert-secret.yaml
+# auto-cert secret (03-cert-secret.yaml in the per-file layout)
 ---
 x-path: /v1/config/strongbox/vaults/myapp/secrets/server-cert
 x-operation: replace
@@ -297,7 +343,8 @@ Operations: `supctl do application-deployments myapp pause|resume|redeploy|canar
 - [ ] `version` and `port-ranges` are quoted strings. Images have explicit tags.
 - [ ] Outbound access is granted if the app calls out. Ingress exists if it must be reached from the site LAN.
 - [ ] No real secret values in committed files.
-- [ ] Every file starts with `---`, `x-path` and `x-operation`. The last `x-path` segment equals `name`, and secret paths use the right vault.
-- [ ] Files are numbered in dependency order (CA → vault → secrets → app → deployment) and the README lists the `supctl patch < file` commands in that order.
+- [ ] Every payload document starts with `---`, `x-path` and `x-operation`. The last `x-path` segment equals `name`, and secret paths use the right vault.
+- [ ] Payloads are in dependency order (CA → vault → secrets → app → deployment): document order in the single file, or file numbering in the per-file layout. The README shows the matching `supctl patch` command(s).
+- [ ] The layout is single-file unless the user asked for separate files (or the directory already uses them).
 
 If the schema can't be confirmed (no supd tools, docs unreachable), say so and point to the matching redoc section (https://avassa-api.redoc.ly, tags `Applications`, `Application-Deployments`, `Vault`) so the user can check the fields.
