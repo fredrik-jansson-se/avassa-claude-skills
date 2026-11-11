@@ -1,0 +1,5 @@
+{
+  "name": "avassa",
+  "description": "Skills for writing Avassa application specs, deployments and Strongbox vaults/secrets",
+  "version": "1.0.0"
+}

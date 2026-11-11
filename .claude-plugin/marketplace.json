@@ -1,0 +1,11 @@
+{
+  "name": "avassa-skills",
+  "owner": { "name": "Fredrik Jansson" },
+  "plugins": [
+    {
+      "name": "avassa",
+      "source": "./plugins/avassa",
+      "description": "Skills for writing Avassa application specs, deployments and Strongbox vaults/secrets"
+    }
+  ]
+}
